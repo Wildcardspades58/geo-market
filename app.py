@@ -11,11 +11,16 @@ import json
 import os
 import concurrent.futures
 
-app = Flask(__name__)
+# --- ABSOLUTE PATH CONFIGURATION ---
+# This explicitly finds the path to 'app.py' and points Flask to the 'templates' folder next to it.
+# This fixes the "TemplateNotFound" error on cloud servers.
+base_dir = os.path.abspath(os.path.dirname(__file__))
+template_dir = os.path.join(base_dir, 'templates')
+
+app = Flask(__name__, template_folder=template_dir)
+# -----------------------------------
 
 # --- Configuration ---
-# In production (cloud), we cannot rely on a persistent local file if the server restarts.
-# However, for a simple cache, a local file is fine for now, or we rely on memory.
 DB_FILE = 'geo_market_data.json'
 CACHE_DURATION = 3600  # 1 Hour
 
@@ -116,7 +121,7 @@ def save_db(data):
         with open(DB_FILE, 'w') as f:
             json.dump(data, f, indent=4)
     except:
-        pass # In cloud environments with ephemeral file systems, this might fail, which is acceptable for now.
+        pass 
 
 def get_ttm_sum(df, key):
     if df is None or df.empty or key not in df.index:
