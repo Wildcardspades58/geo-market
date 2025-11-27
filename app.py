@@ -1,4 +1,4 @@
-from flask import Flask, render_template, jsonify, request, make_response, send_from_directory
+from flask import Flask, render_template, jsonify, request, make_response
 import yfinance as yf
 import pandas as pd
 import statistics
@@ -9,27 +9,32 @@ import csv
 import time
 import json
 import os
+import threading
 import concurrent.futures
 
-# --- CAPITALIZATION FIX ---
-# Linux servers are case-sensitive. 'Templates' != 'templates'.
-# This block detects which one you have and configures Flask accordingly.
+# --- PATH CONFIGURATION ---
 base_dir = os.path.abspath(os.path.dirname(__file__))
-
 if os.path.exists(os.path.join(base_dir, 'Templates')):
-    print(">> DETECTED CAPITALIZED 'Templates' FOLDER")
     template_dir = os.path.join(base_dir, 'Templates')
 else:
-    print(">> Defaulting to standard 'templates' folder")
     template_dir = os.path.join(base_dir, 'templates')
 
-# Initialize Flask with the explicitly found folder
 app = Flask(__name__, template_folder=template_dir)
-# --------------------------
 
 # --- Configuration ---
 DB_FILE = 'geo_market_data.json'
 CACHE_DURATION = 3600  # 1 Hour
+
+# --- Global State ---
+# We use in-memory global variables because Cloud filesystems are ephemeral.
+SERVER_CACHE = {
+    "companies": [],
+    "sectors": {},
+    "last_updated": "Not Started",
+    "timestamp": 0,
+    "status": "idle", # idle, updating
+    "progress": 0
+}
 
 # --- Watchlist Configuration ---
 WATCHLIST = [
@@ -112,34 +117,29 @@ WATCHLIST = [
     {"ticker": "AVGO", "sector": "Tech Enabler", "name": "Broadcom"}
 ]
 
-# --- Database Logic ---
+# --- Helper Functions ---
 
-def load_db():
+def load_initial_data():
+    """ Try to load from disk on startup to seed the cache """
+    global SERVER_CACHE
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, 'r') as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            return None
-    return None
-
-def save_db(data):
-    try:
-        with open(DB_FILE, 'w') as f:
-            json.dump(data, f, indent=4)
-    except:
-        pass 
+                data = json.load(f)
+                SERVER_CACHE.update(data)
+                SERVER_CACHE['status'] = 'idle'
+                print(">> Loaded seed data from disk.")
+        except:
+            print(">> No valid seed data found.")
 
 def get_ttm_sum(df, key):
-    if df is None or df.empty or key not in df.index:
-        return 0.0
+    if df is None or df.empty or key not in df.index: return 0.0
     row = df.loc[key]
     sorted_cols = sorted(df.columns, reverse=True)
     recent_quarters = [row[col] for col in sorted_cols[:4] if pd.notnull(row[col])]
     if not recent_quarters: return 0.0
     if len(recent_quarters) < 4:
-        avg_val = sum(recent_quarters) / len(recent_quarters)
-        return avg_val * 4
+        return (sum(recent_quarters) / len(recent_quarters)) * 4
     return sum(recent_quarters)
 
 def safe_get_latest(df, key, default=0):
@@ -151,23 +151,17 @@ def safe_get_latest(df, key, default=0):
     return default
 
 def calculate_metrics_robust(info, bs, cf, fins, quarterly_fins):
-    metrics = {
-        "z_score": 0.0, "fcf_yield": 0.0, "runway": 99.0, 
-        "de_ratio": 0.0, "score": 50, "raw_debt": 0, "raw_cash": 0
-    }
-    
+    metrics = {"z_score": 0.0, "fcf_yield": 0.0, "runway": 99.0, "de_ratio": 0.0, "score": 50, "raw_debt": 0, "raw_cash": 0}
     try:
         market_cap = info.get('marketCap', 0)
-        if market_cap == 0 and info.get('previousClose') and info.get('sharesOutstanding'):
-            market_cap = info['previousClose'] * info['sharesOutstanding']
+        if market_cap == 0 and info.get('previousClose'): market_cap = info['previousClose'] * info.get('sharesOutstanding', 0)
         if market_cap == 0: market_cap = 1000000 
         
         total_debt = safe_get_latest(bs, 'Total Debt')
         if total_debt == 0: total_debt = info.get('totalDebt', 0)
 
         cash = safe_get_latest(bs, 'Cash And Cash Equivalents')
-        if cash == 0: 
-            cash = safe_get_latest(bs, 'Cash Cash Equivalents And Short Term Investments')
+        if cash == 0: cash = safe_get_latest(bs, 'Cash Cash Equivalents And Short Term Investments')
         if cash == 0: cash = info.get('totalCash', 0)
 
         total_assets = safe_get_latest(bs, 'Total Assets')
@@ -178,31 +172,24 @@ def calculate_metrics_robust(info, bs, cf, fins, quarterly_fins):
         
         ebit_ttm = get_ttm_sum(quarterly_fins, 'EBIT')
         revenue_ttm = get_ttm_sum(quarterly_fins, 'Total Revenue')
-        net_income_ttm = get_ttm_sum(quarterly_fins, 'Net Income')
         net_income_mrq = safe_get_latest(quarterly_fins, 'Net Income')
         
         op_cash_flow_ttm = get_ttm_sum(cf, 'Operating Cash Flow')
         capex_ttm = abs(get_ttm_sum(cf, 'Capital Expenditure'))
 
         total_equity = total_assets - total_liab
-        if total_equity > 0:
-            metrics['de_ratio'] = round(total_debt / total_equity, 2)
-        elif total_debt > 0:
-            metrics['de_ratio'] = 99.0 
-        else:
-            metrics['de_ratio'] = 0.0
+        if total_equity > 0: metrics['de_ratio'] = round(total_debt / total_equity, 2)
+        elif total_debt > 0: metrics['de_ratio'] = 99.0 
+        else: metrics['de_ratio'] = 0.0
 
         fcf_ttm = op_cash_flow_ttm - capex_ttm
         metrics['fcf_yield'] = round((fcf_ttm / market_cap) * 100, 2)
 
         if net_income_mrq < 0:
             monthly_burn = abs(net_income_mrq) / 3
-            if monthly_burn > 0:
-                metrics['runway'] = round(cash / monthly_burn, 1)
-            else:
-                metrics['runway'] = 0.0
-        else:
-            metrics['runway'] = 999.0
+            if monthly_burn > 0: metrics['runway'] = round(cash / monthly_burn, 1)
+            else: metrics['runway'] = 0.0
+        else: metrics['runway'] = 999.0
 
         if total_assets > 0 and total_liab > 0:
             A = (curr_assets - curr_liab) / total_assets
@@ -227,15 +214,21 @@ def calculate_metrics_robust(info, bs, cf, fins, quarterly_fins):
         metrics['raw_cash'] = cash
         return metrics
 
-    except Exception as e:
+    except Exception:
         return metrics
 
 def fetch_single_ticker(item):
+    """ Worker function for threads """
     try:
         sym = item['ticker']
         stock = yf.Ticker(sym)
-        try: info = stock.info
+        # Fast Info first (low latency)
+        try: info = stock.fast_info
         except: info = {}
+        
+        # Heavy data (timeout protection)
+        # Note: yfinance doesn't support timeouts natively easily, so we rely on thread timeouts or just hope.
+        # We wrap in broad try/except to prevent thread death.
         try: bs_q = stock.quarterly_balance_sheet
         except: bs_q = None
         try: cf_q = stock.quarterly_cashflow
@@ -243,14 +236,20 @@ def fetch_single_ticker(item):
         try: fins_q = stock.quarterly_financials
         except: fins_q = None
         
-        metrics = calculate_metrics_robust(info, bs_q, cf_q, fins_q, fins_q)
+        # Fallback to full info if fast_info lacks data
+        full_info = {}
+        try: full_info = stock.info
+        except: pass
+        
+        # Merge info sources
+        combined_info = {**full_info}
+        
+        metrics = calculate_metrics_robust(combined_info, bs_q, cf_q, fins_q, fins_q)
+        
         price = 0
-        if info:
-             price = info.get('currentPrice', info.get('regularMarketPrice', 0))
-        if price == 0:
-             try: price = stock.fast_info['last_price']
-             except: pass
-
+        if hasattr(info, 'last_price'): price = info.last_price
+        elif 'currentPrice' in full_info: price = full_info['currentPrice']
+        
         return {
             **item, "price": round(price, 2), "de_ratio": metrics['de_ratio'],
             "z_score": metrics['z_score'], "fcf_yield": metrics['fcf_yield'],
@@ -258,96 +257,98 @@ def fetch_single_ticker(item):
             "raw_debt": metrics['raw_debt'], "raw_cash": metrics['raw_cash']
         }
     except Exception as e:
-        print(f"Failed to fetch {item['ticker']}: {e}")
+        print(f"Error fetching {item['ticker']}: {e}")
         return None
+
+def background_updater():
+    """ This runs in a separate thread to update data without blocking the UI """
+    global SERVER_CACHE
+    print(">> Starting Background Update...")
+    SERVER_CACHE['status'] = 'updating'
+    SERVER_CACHE['progress'] = 0
+    
+    total_tickers = len(WATCHLIST)
+    updated_data = []
+    completed = 0
+    
+    # Use fewer workers to be gentle on free tier CPUs
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(fetch_single_ticker, item): item for item in WATCHLIST}
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if res:
+                updated_data.append(res)
+            completed += 1
+            SERVER_CACHE['progress'] = int((completed / total_tickers) * 100)
+            
+    # Calculate sectors
+    sector_stats = {}
+    for c in updated_data:
+        sec = c['sector']
+        if sec not in sector_stats: sector_stats[sec] = []
+        sector_stats[sec].append(c['score'])
+    sector_averages = {k: round(statistics.mean(v)) for k,v in sector_stats.items() if v}
+
+    # Update Global Cache
+    SERVER_CACHE['companies'] = updated_data
+    SERVER_CACHE['sectors'] = sector_averages
+    SERVER_CACHE['timestamp'] = time.time()
+    SERVER_CACHE['last_updated'] = datetime.datetime.now().strftime("%H:%M:%S")
+    SERVER_CACHE['status'] = 'idle'
+    SERVER_CACHE['progress'] = 100
+    
+    # Try to save to disk (best effort for next restart)
+    try:
+        with open(DB_FILE, 'w') as f:
+            json.dump(SERVER_CACHE, f, indent=4)
+    except: pass
+    
+    print(">> Background Update Complete.")
+
+# Load seed data on startup
+load_initial_data()
 
 # --- Routes ---
 
 @app.route('/')
 def index():
-    # --- DIAGNOSTIC: Check if file exists before trying to render it ---
-    # This block is here just in case the path is still weird, 
-    # it gives you a clear error message in the browser.
-    file_path = os.path.join(template_dir, 'index.html')
-    if not os.path.exists(file_path):
-        debug_msg = f"""
-        <h1>Error: Index File Not Found</h1>
-        <p>Flask is looking in: <b>{template_dir}</b></p>
-        <p>Actually checking file: <b>{file_path}</b></p>
-        <p>Does folder exist?: <b>{os.path.exists(template_dir)}</b></p>
-        <p>Folder Contents: <b>{os.listdir(template_dir) if os.path.exists(template_dir) else 'Folder not found'}</b></p>
-        """
-        return debug_msg, 500
-    
     return render_template('index.html')
 
 @app.route('/manifest.json')
 def manifest():
     return jsonify({
-        "name": "Geospatial Market",
-        "short_name": "GeoMarket",
-        "start_url": "/",
-        "display": "standalone",
-        "background_color": "#0f172a",
-        "theme_color": "#0f172a",
-        "icons": [
-            {
-                "src": "https://cdn-icons-png.flaticon.com/512/4742/4742749.png", 
-                "sizes": "192x192",
-                "type": "image/png"
-            }
-        ]
+        "name": "Geospatial Market", "short_name": "GeoMarket",
+        "start_url": "/", "display": "standalone",
+        "background_color": "#0f172a", "theme_color": "#0f172a",
+        "icons": [{"src": "https://cdn-icons-png.flaticon.com/512/4742/4742749.png", "sizes": "192x192", "type": "image/png"}]
     })
 
 @app.route('/api/dashboard-data')
 def get_dashboard_data():
+    """ 
+    NON-BLOCKING ENDPOINT 
+    Returns current cache immediately. Triggers update if stale.
+    """
+    global SERVER_CACHE
     now = time.time()
-    db = load_db()
     
-    needs_update = False
-    if not db or (now - db.get('timestamp', 0) > CACHE_DURATION):
-        needs_update = True
-    else:
-        db_tickers = {c['ticker'] for c in db.get('companies', [])}
-        config_tickers = {c['ticker'] for c in WATCHLIST}
-        if not config_tickers.issubset(db_tickers):
-            needs_update = True
-
-    if not needs_update:
-        return jsonify(db)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        results = list(executor.map(fetch_single_ticker, WATCHLIST))
+    is_stale = (now - SERVER_CACHE.get('timestamp', 0)) > CACHE_DURATION
+    is_empty = len(SERVER_CACHE.get('companies', [])) == 0
+    is_idle = SERVER_CACHE.get('status') == 'idle'
     
-    company_data = [r for r in results if r is not None]
-
-    sector_stats = {}
-    for c in company_data:
-        sec = c['sector']
-        if sec not in sector_stats: sector_stats[sec] = []
-        sector_stats[sec].append(c['score'])
-
-    sector_averages = {k: round(statistics.mean(v)) for k,v in sector_stats.items() if v}
-    last_updated = datetime.datetime.now().strftime("%H:%M:%S")
+    # If stale/empty AND not already updating, start the thread
+    if (is_stale or is_empty) and is_idle:
+        thread = threading.Thread(target=background_updater)
+        thread.start()
     
-    new_db = {
-        "companies": company_data, 
-        "sectors": sector_averages,
-        "last_updated": last_updated,
-        "timestamp": now,
-        "source": "Live API"
-    }
-    
-    save_db(new_db)
-    return jsonify(new_db)
+    return jsonify(SERVER_CACHE)
 
 @app.route('/api/market-chart')
 def get_market_chart():
-    period = request.args.get('period', '3mo')
-    tickers = [x['ticker'] for x in WATCHLIST]
-    tickers.append("SPY")
+    # Keep chart separate as it's lighter
     try:
-        data = yf.download(tickers, period=period, interval="1d", auto_adjust=True, progress=False)['Close']
+        tickers = [x['ticker'] for x in WATCHLIST] + ["SPY"]
+        data = yf.download(tickers, period='3mo', interval="1d", auto_adjust=True, progress=False)['Close']
         if data.empty: return jsonify({"dates":[], "geo_index":[], "spy_index":[]})
         
         normalized = data.ffill().apply(lambda x: (x / x.iloc[0]) - 1) * 100
@@ -363,6 +364,7 @@ def get_market_chart():
 
 @app.route('/api/news')
 def get_news():
+    # ... (Keep existing news logic, it's fast enough) ...
     proxies = ["RKLB", "LMT", "PLTR"]
     news_feed = []
     seen = set()
@@ -383,30 +385,24 @@ def get_news():
                     })
                     seen.add(title)
     except: pass
-    
     if len(news_feed) < 5:
         try:
             feed = feedparser.parse("https://spacenews.com/feed/")
             for entry in feed.entries[:5]:
                 if entry.title not in seen:
-                    news_feed.append({
-                        "title": entry.title, "publisher": "SpaceNews",
-                        "link": entry.link, "time": "Latest",
-                        "related": "SECTOR", "type": "General"
-                    })
+                    news_feed.append({"title": entry.title, "publisher": "SpaceNews", "link": entry.link, "time": "Latest", "related": "SECTOR", "type": "General"})
                     seen.add(entry.title)
         except: pass
     return jsonify({"items": news_feed[:10], "updated": datetime.datetime.now().strftime("%d %b %H:%M")})
 
 @app.route('/api/company-details/<ticker>')
 def get_company_details(ticker):
+    # Keep specific detail fetch on demand
     try:
         stock = yf.Ticker(ticker)
-        info = stock.fast_info
         try: full_info = stock.info
         except: full_info = {}
         hist = stock.history(period="1y")
-        
         insider_data = []
         try:
             insider = stock.insider_transactions
@@ -416,24 +412,17 @@ def get_company_details(ticker):
                     date_val = index
                     if hasattr(date_val, 'strftime'): date_str = date_val.strftime('%Y-%m-%d')
                     else: date_str = str(date_val).split(' ')[0]
-                    insider_data.append({
-                        "date": date_str, "insider": row.get('Insider', 'Unknown'),
-                        "shares": int(row.get('Shares', 0)), "type": "Sell" if "Sale" in str(row.get('Transaction', '')) else "Buy"
-                    })
+                    insider_data.append({"date": date_str, "insider": row.get('Insider', 'Unknown'), "shares": int(row.get('Shares', 0)), "type": "Sell" if "Sale" in str(row.get('Transaction', '')) else "Buy"})
         except: pass 
-
         earnings_msg = "Unknown"
         try:
             cal = stock.calendar
             if cal is not None and not cal.empty:
-                if 'Earnings Date' in cal: val = cal['Earnings Date'][0]
-                elif 0 in cal: val = cal[0][0]
-                else: val = cal.iloc[0][0]
+                val = cal['Earnings Date'][0] if 'Earnings Date' in cal else cal.iloc[0][0]
                 if hasattr(val, 'date'):
                     days_diff = (val.date() - datetime.datetime.now().date()).days
                     earnings_msg = f"In {days_diff} Days ({val.strftime('%d %b')})"
         except: pass
-
         de_dates, de_values = [], []
         try:
             financials = stock.quarterly_balance_sheet
@@ -453,19 +442,17 @@ def get_company_details(ticker):
                         except: continue
         except: pass
         if not de_values: de_dates, de_values = ["No Data"], [0]
-
         z_components = {}
         try:
             bs = stock.quarterly_balance_sheet
             ta = safe_get_latest(bs, 'Total Assets')
             tl = safe_get_latest(bs, 'Total Liabilities Net Minority Interest')
-            mc = info.market_cap if info.market_cap else 0
+            mc = full_info.get('marketCap', 0)
             if ta > 0:
                 z_components['Total Assets'] = f"${ta/1e9:.2f}B"
                 z_components['Total Liab'] = f"${tl/1e9:.2f}B"
                 z_components['Market Cap'] = f"${mc/1e9:.2f}B"
         except: pass
-
         return jsonify({
             "description": full_info.get('longBusinessSummary', 'No description available.'),
             "employees": full_info.get('fullTimeEmployees', 'N/A'),
@@ -483,12 +470,12 @@ def get_company_details(ticker):
 
 @app.route('/api/export-csv')
 def export_csv():
-    db = load_db()
-    if not db: return "No data available.", 404
+    global SERVER_CACHE
+    if not SERVER_CACHE['companies']: return "No data available.", 404
     si = io.StringIO()
     cw = csv.writer(si)
     cw.writerow(["Ticker", "Company", "Sector", "Price", "Score", "D/E", "Z-Score", "FCF Yield", "Runway"])
-    for c in db['companies']:
+    for c in SERVER_CACHE['companies']:
         cw.writerow([c['ticker'], c['name'], c['sector'], c['price'], c['score'], c['de_ratio'], c['z_score'], c['fcf_yield'], c['runway']])
     output = make_response(si.getvalue())
     output.headers["Content-Disposition"] = "attachment; filename=GeoIntel_Report.csv"
