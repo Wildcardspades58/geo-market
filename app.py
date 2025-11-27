@@ -11,11 +11,18 @@ import json
 import os
 import concurrent.futures
 
-# --- ABSOLUTE PATH CONFIGURATION ---
-# This explicitly finds the path to 'app.py' and points Flask to the 'templates' folder next to it.
-# This fixes the "TemplateNotFound" error on cloud servers.
+# --- DIAGNOSTIC PATH CONFIGURATION ---
 base_dir = os.path.abspath(os.path.dirname(__file__))
-template_dir = os.path.join(base_dir, 'templates')
+# Try to find the templates folder, checking for capitalization issues
+possible_dirs = ['templates', 'Templates', 'TEMPLATE']
+template_dir = os.path.join(base_dir, 'templates') # Default
+
+for d in possible_dirs:
+    check_path = os.path.join(base_dir, d)
+    if os.path.exists(check_path):
+        template_dir = check_path
+        print(f">> FOUND TEMPLATE DIR AT: {template_dir}")
+        break
 
 app = Flask(__name__, template_folder=template_dir)
 # -----------------------------------
@@ -258,9 +265,22 @@ def fetch_single_ticker(item):
 
 @app.route('/')
 def index():
+    # --- DIAGNOSTIC: Check if file exists before trying to render it ---
+    file_path = os.path.join(template_dir, 'index.html')
+    if not os.path.exists(file_path):
+        # If standard render fails, show debug info in browser
+        debug_msg = f"""
+        <h1>Error: Index File Not Found</h1>
+        <p>Looking in: <b>{template_dir}</b></p>
+        <p>Checking for file: <b>{file_path}</b></p>
+        <p>Directory Exists? <b>{os.path.exists(template_dir)}</b></p>
+        <p>Directory Contents: <b>{os.listdir(template_dir) if os.path.exists(template_dir) else 'N/A'}</b></p>
+        <p>Current Working Dir: <b>{os.getcwd()}</b></p>
+        """
+        return debug_msg, 500
+    
     return render_template('index.html')
 
-# This is new: Serves the Manifest file so Android treats it as an App
 @app.route('/manifest.json')
 def manifest():
     return jsonify({
